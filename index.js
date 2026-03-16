@@ -4,17 +4,17 @@ const http = require('http');
 const os = require('os');
 
 // =========================================
-// CONFIGURATION
+// CONFIGURATION - USING ENVIRONMENT VARIABLES
 // =========================================
-const PORT = 8080;
+const PORT = process.env.PORT || 8080;
 
-// HostPinnacle Database Configuration
+// Database Configuration - ALL from environment variables
 const DB_CONFIG = {
-    host: '212.95.55.182',     // Your HostPinnacle server IP
-    user: 'mulacras_mula',      // Your database username
-    password: '1952Swiss',      // Your database password
-    database: 'mulacras_mulacrash', // Your database name
-    port: 3306,                  // Default MySQL port
+    host: process.env.DB_HOST || '212.95.55.182',     // Your HostPinnacle server IP
+    user: process.env.DB_USER || 'mulacras_mula',      // Your database username
+    password: process.env.DB_PASSWORD || '1952Swiss',  // Your database password
+    database: process.env.DB_NAME || 'mulacras_mulacrash', // Your database name
+    port: 3306,
     waitForConnections: true,
     connectionLimit: 10,
     connectTimeout: 10000,
@@ -121,10 +121,16 @@ async function connectToHostPinnacleDB() {
             console.error('   ⚠️  Database does not exist');
         } else if (err.code === 'ECONNREFUSED') {
             console.error('   ⚠️  Connection refused - HostPinnacle may not allow remote MySQL connections');
-            console.error('   💡 Make sure Remote MySQL is enabled in cPanel with IP: 51.75.118.5');
+            console.error('   💡 Make sure Remote MySQL is enabled in cPanel with these Render IPs:');
+            console.error('      54.158.73.147');
+            console.error('      52.55.241.89');
+            console.error('      18.212.66.77');
         } else if (err.code === 'ETIMEDOUT') {
             console.error('   ⚠️  Connection timeout - HostPinnacle firewall may be blocking');
-            console.error('   💡 Add this IP to Remote MySQL in cPanel: 51.75.118.5');
+            console.error('   💡 Add these Render IPs to Remote MySQL in cPanel:');
+            console.error('      54.158.73.147');
+            console.error('      52.55.241.89');
+            console.error('      18.212.66.77');
         }
         
         console.log('⚠️  Game will run WITHOUT database - rounds will not be saved');
@@ -239,12 +245,12 @@ const server = http.createServer((req, res) => {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
             status: 'running',
+            port: PORT,
             gameState: gameState.status,
             round: gameState.roundNumber,
             multiplier: gameState.multiplier,
             connections: gameState.clients.size,
             dbAvailable: dbAvailable,
-            uptime: process.uptime(),
             serverIPs: getServerIPs(),
             timestamp: new Date().toISOString()
         }));
@@ -270,7 +276,6 @@ const server = http.createServer((req, res) => {
                     h1 { color: #ffd700; }
                     .info { background: #1a1e24; padding: 20px; border-radius: 10px; margin: 20px; display: inline-block; text-align: left; }
                     .status-online { color: #44ff44; }
-                    .status-offline { color: #ff4444; }
                     .db-connected { color: #44ff44; }
                     .db-disconnected { color: #ff4444; }
                 </style>
@@ -278,17 +283,15 @@ const server = http.createServer((req, res) => {
             <body>
                 <h1>🚀 MulaCrash Game Server</h1>
                 <div class="info">
-                    <p>✅ Server Status: <span class="status-online">ONLINE</span></p>
+                    <p>✅ Status: <span class="status-online">ONLINE</span></p>
                     <p>📡 Port: ${PORT}</p>
-                    <p>🌐 Server IPs: ${getServerIPs().join(', ')}</p>
+                    <p>🌐 Server IP: ${getServerIPs().join(', ')}</p>
                     <p>💾 Database: <span class="${dbAvailable ? 'db-connected' : 'db-disconnected'}">${dbAvailable ? 'CONNECTED' : 'DISCONNECTED'}</span></p>
-                    <p>🔄 Current Round: ${gameState.roundNumber}</p>
-                    <p>📊 Game State: ${gameState.status}</p>
-                    <p>👥 Active Connections: ${gameState.clients.size}</p>
-                    <p>💰 Active Bets: ${gameState.bets.size}</p>
+                    <p>🔄 Round: ${gameState.roundNumber}</p>
+                    <p>👥 Connections: ${gameState.clients.size}</p>
                 </div>
-                <p>WebSocket URL: <strong>ws://51.75.118.5:${PORT}</strong></p>
-                <p>Health Check: <a href="/health" style="color:#ffd700;">/health</a></p>
+                <p>🔌 WebSocket: <strong>wss://mulacrash-ws.onrender.com</strong></p>
+                <p>📊 <a href="/health" style="color:#ffd700;">Health Check</a></p>
             </body>
             </html>
         `);
@@ -307,9 +310,7 @@ function broadcast(data) {
         if (client.readyState === WebSocket.OPEN) {
             try {
                 client.send(message);
-            } catch (err) {
-                console.log(`❌ Error sending to client ${id}:`, err.message);
-            }
+            } catch (err) {}
         }
     });
 }
@@ -400,7 +401,6 @@ async function gameLoop() {
                     lastTimerUpdate = now;
                     
                 } else {
-                    // Only broadcast if clients are connected
                     if (gameState.clients.size > 0) {
                         broadcast({ 
                             type: 'multiplier', 
@@ -423,22 +423,12 @@ async function gameLoop() {
 // =========================================
 wss.on('connection', (ws, req) => {
     const clientIp = req.socket.remoteAddress;
-    const clientPort = req.socket.remotePort;
-    const forwardedFor = req.headers['x-forwarded-for'];
-    const userAgent = req.headers['user-agent'];
     const clientId = Date.now() + Math.random().toString(36).substr(2, 6);
     
-    console.log('🟢 NEW CLIENT CONNECTED!');
-    console.log('   Client ID:', clientId);
-    console.log('   IP:', clientIp);
-    console.log('   Port:', clientPort);
-    console.log('   Forwarded For:', forwardedFor);
-    console.log('   User Agent:', userAgent);
-    console.log('   Total Clients:', gameState.clients.size + 1);
-    
+    console.log(`🟢 Client ${clientId} connected from ${clientIp}`);
     gameState.clients.set(clientId, ws);
     
-    // Send initial game state
+    // Send initial state
     try {
         ws.send(JSON.stringify({
             type: 'state',
@@ -449,10 +439,7 @@ wss.on('connection', (ws, req) => {
                 roundNumber: gameState.roundNumber
             }
         }));
-        console.log(`📨 Sent initial state to ${clientId}`);
-    } catch (err) {
-        console.log(`❌ Failed to send initial state:`, err.message);
-    }
+    } catch (err) {}
     
     // Send recent history
     if (dbAvailable) {
@@ -465,9 +452,7 @@ wss.on('connection', (ws, req) => {
                     type: 'history',
                     history: rows
                 }));
-            } catch (err) {
-                console.log('❌ Failed to fetch history:', err.message);
-            }
+            } catch (err) {}
         })();
     }
     
@@ -475,7 +460,6 @@ wss.on('connection', (ws, req) => {
     ws.on('message', (message) => {
         try {
             const data = JSON.parse(message);
-            console.log(`📩 Message from ${clientId}:`, data.type || 'unknown');
             
             switch(data.type) {
                 case 'ping':
@@ -529,35 +513,18 @@ wss.on('connection', (ws, req) => {
                     }
                     break;
             }
-        } catch (err) {
-            console.log(`❌ Message error from ${clientId}:`, err.message);
-        }
+        } catch (err) {}
     });
     
-    ws.on('close', (code, reason) => {
-        console.log(`🔴 Client ${clientId} disconnected. Code: ${code}, Reason: ${reason}`);
+    ws.on('close', () => {
+        console.log(`🔴 Client ${clientId} disconnected`);
         gameState.clients.delete(clientId);
         gameState.bets.delete(clientId);
-        console.log(`   Remaining Clients: ${gameState.clients.size}`);
     });
     
     ws.on('error', (err) => {
         console.log(`❌ WebSocket error for ${clientId}:`, err.message);
     });
-    
-    // Send ping to keep connection alive
-    const pingInterval = setInterval(() => {
-        if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'ping' }));
-        } else {
-            clearInterval(pingInterval);
-        }
-    }, 30000);
-});
-
-// Handle server errors
-server.on('error', (err) => {
-    console.error('❌ Server error:', err.message);
 });
 
 // =========================================
@@ -575,11 +542,11 @@ async function startServer() {
     // Connect to database
     await connectToHostPinnacleDB();
     
-    // Start server - bind to all interfaces
+    // Start server
     server.listen(PORT, '0.0.0.0', () => {
         console.log(`🌐 Server listening on port ${PORT}`);
         console.log(`📊 Health check: http://localhost:${PORT}/health`);
-        console.log(`🔌 WebSocket URL: ws://51.75.118.5:${PORT}`);
+        console.log(`🔌 WebSocket URL: wss://mulacrash-ws.onrender.com`);
         console.log('=================================');
         
         // Start game loop
