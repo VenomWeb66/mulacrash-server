@@ -1,0 +1,21 @@
+{
+  "name": "mulacrash-websocket",
+  "version": "1.0.0",
+  "description": "MulaCrash WebSocket Game Server - Hosted on KataBump",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "ws": "^8.14.2",
+    "mysql2": "^3.6.5"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "keywords": ["websocket", "game", "crash", "mulacrash", "betting"],
+  "author": "MulaCrash",
+  "license": "ISC"
+}

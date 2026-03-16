@@ -1,0 +1,631 @@
+const WebSocket = require('ws');
+const mysql = require('mysql2/promise');
+const http = require('http');
+const os = require('os');
+
+// =========================================
+// CONFIGURATION
+// =========================================
+const PORT = 8080;
+
+// HostPinnacle Database Configuration
+const DB_CONFIG = {
+    host: '212.95.55.182',     // Your HostPinnacle server IP
+    user: 'mulacras_mula',      // Your database username
+    password: '1952Swiss',      // Your database password
+    database: 'mulacras_mulacrash', // Your database name
+    port: 3306,                  // Default MySQL port
+    waitForConnections: true,
+    connectionLimit: 10,
+    connectTimeout: 10000,
+    enableKeepAlive: true,
+    keepAliveInitialDelay: 0
+};
+
+// =========================================
+// GAME STATE
+// =========================================
+let gameState = {
+    status: 'waiting',  // waiting, flying, crashed
+    multiplier: 1.00,
+    crashPoint: 0,
+    roundTimer: 10,
+    roundNumber: 1,
+    startTime: null,
+    endTime: null,
+    clients: new Map(),
+    bets: new Map()
+};
+
+// =========================================
+// UTILITY FUNCTIONS
+// =========================================
+function getServerIPs() {
+    const nets = os.networkInterfaces();
+    const ips = [];
+    for (const name of Object.keys(nets)) {
+        for (const net of nets[name]) {
+            if (net.family === 'IPv4' && !net.internal) {
+                ips.push(net.address);
+            }
+        }
+    }
+    return ips;
+}
+
+// =========================================
+// DATABASE CONNECTION
+// =========================================
+let pool = null;
+let dbAvailable = false;
+
+async function connectToHostPinnacleDB() {
+    console.log('🔄 Attempting to connect to HostPinnacle database...');
+    console.log(`📊 Host: ${DB_CONFIG.host}`);
+    console.log(`📊 Database: ${DB_CONFIG.database}`);
+    console.log(`📊 User: ${DB_CONFIG.user}`);
+    
+    try {
+        // Create connection pool
+        pool = await mysql.createPool(DB_CONFIG);
+        
+        // Test connection
+        const connection = await pool.getConnection();
+        console.log('✅ Successfully connected to HostPinnacle database!');
+        
+        // Test query
+        const [rows] = await connection.query('SELECT 1+1 as result');
+        console.log('✅ Database query test successful:', rows[0]);
+        
+        // Create tables if they don't exist
+        await connection.query(`
+            CREATE TABLE IF NOT EXISTS round_history (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                round_number INT NOT NULL,
+                crash_point DECIMAL(10,2) NOT NULL,
+                started_at DATETIME,
+                ended_at DATETIME,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+        
+        // Create settings table if it doesn't exist
+        await connection.query(`
+            CREATE TABLE IF NOT EXISTS settings (
+                id INT PRIMARY KEY DEFAULT 1,
+                multiplier_type ENUM('random', 'fixed') DEFAULT 'random',
+                fixed_crash_point DECIMAL(10,2) DEFAULT 2.00,
+                house_edge DECIMAL(5,2) DEFAULT 5.00,
+                game_paused BOOLEAN DEFAULT 0,
+                risk_profile ENUM('normal', 'low', 'high', 'extreme') DEFAULT 'normal'
+            )
+        `);
+        
+        // Insert default settings if not exists
+        await connection.query(`
+            INSERT IGNORE INTO settings (id) VALUES (1)
+        `);
+        
+        console.log('✅ Tables ready');
+        connection.release();
+        dbAvailable = true;
+        return true;
+        
+    } catch (err) {
+        console.error('❌ Failed to connect to HostPinnacle database:');
+        console.error('   Error:', err.message);
+        
+        if (err.code === 'ER_ACCESS_DENIED_ERROR') {
+            console.error('   ⚠️  Wrong username or password');
+        } else if (err.code === 'ER_BAD_DB_ERROR') {
+            console.error('   ⚠️  Database does not exist');
+        } else if (err.code === 'ECONNREFUSED') {
+            console.error('   ⚠️  Connection refused - HostPinnacle may not allow remote MySQL connections');
+            console.error('   💡 Make sure Remote MySQL is enabled in cPanel with IP: 51.75.118.5');
+        } else if (err.code === 'ETIMEDOUT') {
+            console.error('   ⚠️  Connection timeout - HostPinnacle firewall may be blocking');
+            console.error('   💡 Add this IP to Remote MySQL in cPanel: 51.75.118.5');
+        }
+        
+        console.log('⚠️  Game will run WITHOUT database - rounds will not be saved');
+        dbAvailable = false;
+        return false;
+    }
+}
+
+// =========================================
+// SAVE ROUND TO DATABASE
+// =========================================
+async function saveRoundToDatabase(roundNumber, crashPoint, startTime, endTime) {
+    if (!dbAvailable || !pool) {
+        console.log('📝 Round not saved (database unavailable)');
+        return false;
+    }
+    
+    try {
+        await pool.query(
+            'INSERT INTO round_history (round_number, crash_point, started_at, ended_at) VALUES (?, ?, ?, ?)',
+            [roundNumber, crashPoint, startTime, endTime]
+        );
+        console.log('✅ Round saved to database');
+        return true;
+    } catch (err) {
+        console.error('❌ Failed to save round:', err.message);
+        return false;
+    }
+}
+
+// =========================================
+// LOAD SETTINGS
+// =========================================
+async function loadSettings() {
+    if (!dbAvailable || !pool) {
+        return {
+            multiplier_type: 'random',
+            fixed_crash_point: 2.0,
+            house_edge: 5,
+            game_paused: 0,
+            risk_profile: 'normal'
+        };
+    }
+    
+    try {
+        const [rows] = await pool.query('SELECT * FROM settings WHERE id = 1');
+        if (rows.length > 0) {
+            return rows[0];
+        }
+        return {
+            multiplier_type: 'random',
+            fixed_crash_point: 2.0,
+            house_edge: 5,
+            game_paused: 0,
+            risk_profile: 'normal'
+        };
+    } catch (error) {
+        console.error('Error loading settings:', error);
+        return {
+            multiplier_type: 'random',
+            fixed_crash_point: 2.0,
+            house_edge: 5,
+            game_paused: 0,
+            risk_profile: 'normal'
+        };
+    }
+}
+
+// =========================================
+// GENERATE CRASH POINT
+// =========================================
+function generateCrashPoint(settings) {
+    if (settings.multiplier_type === 'fixed') {
+        return parseFloat(settings.fixed_crash_point);
+    } else {
+        let crashPoint;
+        switch(settings.risk_profile) {
+            case 'low':
+                crashPoint = 1.2 + (Math.random() * 1.8);
+                break;
+            case 'high':
+                crashPoint = 2.0 + (Math.random() * 48);
+                break;
+            case 'extreme':
+                crashPoint = 3.0 + (Math.random() * 97);
+                break;
+            default:
+                crashPoint = 1.5 + (Math.random() * 8.5);
+        }
+        // Apply house edge
+        crashPoint = crashPoint * (1 - (settings.house_edge / 100));
+        return parseFloat(crashPoint.toFixed(2));
+    }
+}
+
+// =========================================
+// HTTP SERVER
+// =========================================
+const server = http.createServer((req, res) => {
+    // Enable CORS
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    
+    if (req.method === 'OPTIONS') {
+        res.writeHead(204);
+        res.end();
+        return;
+    }
+    
+    if (req.url === '/health') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            status: 'running',
+            gameState: gameState.status,
+            round: gameState.roundNumber,
+            multiplier: gameState.multiplier,
+            connections: gameState.clients.size,
+            dbAvailable: dbAvailable,
+            uptime: process.uptime(),
+            serverIPs: getServerIPs(),
+            timestamp: new Date().toISOString()
+        }));
+    } else if (req.url === '/stats') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            activeBets: gameState.bets.size,
+            activePlayers: gameState.clients.size,
+            currentMultiplier: gameState.multiplier,
+            nextRound: gameState.roundTimer,
+            roundNumber: gameState.roundNumber,
+            dbAvailable: dbAvailable
+        }));
+    } else {
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end(`
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>MulaCrash Game Server</title>
+                <style>
+                    body { font-family: Arial; background: #0a0c0f; color: white; text-align: center; padding: 50px; }
+                    h1 { color: #ffd700; }
+                    .info { background: #1a1e24; padding: 20px; border-radius: 10px; margin: 20px; display: inline-block; text-align: left; }
+                    .status-online { color: #44ff44; }
+                    .status-offline { color: #ff4444; }
+                    .db-connected { color: #44ff44; }
+                    .db-disconnected { color: #ff4444; }
+                </style>
+            </head>
+            <body>
+                <h1>🚀 MulaCrash Game Server</h1>
+                <div class="info">
+                    <p>✅ Server Status: <span class="status-online">ONLINE</span></p>
+                    <p>📡 Port: ${PORT}</p>
+                    <p>🌐 Server IPs: ${getServerIPs().join(', ')}</p>
+                    <p>💾 Database: <span class="${dbAvailable ? 'db-connected' : 'db-disconnected'}">${dbAvailable ? 'CONNECTED' : 'DISCONNECTED'}</span></p>
+                    <p>🔄 Current Round: ${gameState.roundNumber}</p>
+                    <p>📊 Game State: ${gameState.status}</p>
+                    <p>👥 Active Connections: ${gameState.clients.size}</p>
+                    <p>💰 Active Bets: ${gameState.bets.size}</p>
+                </div>
+                <p>WebSocket URL: <strong>ws://51.75.118.5:${PORT}</strong></p>
+                <p>Health Check: <a href="/health" style="color:#ffd700;">/health</a></p>
+            </body>
+            </html>
+        `);
+    }
+});
+
+// =========================================
+// WEBSOCKET SERVER
+// =========================================
+const wss = new WebSocket.Server({ server });
+
+// Broadcast to all clients
+function broadcast(data) {
+    const message = JSON.stringify(data);
+    gameState.clients.forEach((client, id) => {
+        if (client.readyState === WebSocket.OPEN) {
+            try {
+                client.send(message);
+            } catch (err) {
+                console.log(`❌ Error sending to client ${id}:`, err.message);
+            }
+        }
+    });
+}
+
+// Game loop
+let lastTimerUpdate = Date.now();
+async function gameLoop() {
+    try {
+        const settings = await loadSettings();
+        const now = Date.now();
+        
+        if (settings.game_paused) {
+            if (gameState.status !== 'paused') {
+                gameState.status = 'paused';
+                broadcast({ type: 'game_paused', message: 'Game paused by admin' });
+            }
+            setTimeout(gameLoop, 1000);
+            return;
+        }
+        
+        switch(gameState.status) {
+            case 'waiting':
+                if (now - lastTimerUpdate >= 1000) {
+                    gameState.roundTimer--;
+                    lastTimerUpdate = now;
+                    
+                    if (gameState.clients.size > 0) {
+                        broadcast({ 
+                            type: 'timer', 
+                            timer: gameState.roundTimer,
+                            roundNumber: gameState.roundNumber
+                        });
+                    }
+                }
+                
+                if (gameState.roundTimer <= 0) {
+                    gameState.status = 'flying';
+                    gameState.multiplier = 1.00;
+                    gameState.startTime = new Date();
+                    gameState.crashPoint = generateCrashPoint(settings);
+                    gameState.roundNumber++;
+                    
+                    console.log(`🚀 Round ${gameState.roundNumber} started. Crash point: ${gameState.crashPoint.toFixed(2)}x | Clients: ${gameState.clients.size}`);
+                    
+                    if (gameState.clients.size > 0) {
+                        broadcast({ 
+                            type: 'start', 
+                            crashPoint: gameState.crashPoint,
+                            multiplier: gameState.multiplier,
+                            roundNumber: gameState.roundNumber
+                        });
+                    }
+                }
+                break;
+                
+            case 'flying':
+                gameState.multiplier += 0.015;
+                gameState.multiplier = parseFloat(gameState.multiplier.toFixed(2));
+                
+                if (gameState.multiplier >= gameState.crashPoint) {
+                    gameState.status = 'crashed';
+                    gameState.endTime = new Date();
+                    
+                    console.log(`💥 Round ${gameState.roundNumber} crashed at ${gameState.multiplier.toFixed(2)}x`);
+                    
+                    // Save to database
+                    await saveRoundToDatabase(
+                        gameState.roundNumber,
+                        gameState.multiplier,
+                        gameState.startTime,
+                        gameState.endTime
+                    );
+                    
+                    // Clear bets
+                    gameState.bets.clear();
+                    
+                    if (gameState.clients.size > 0) {
+                        broadcast({ 
+                            type: 'crash', 
+                            crashPoint: gameState.multiplier,
+                            roundNumber: gameState.roundNumber
+                        });
+                    }
+                    
+                    // Prepare next round
+                    gameState.status = 'waiting';
+                    gameState.roundTimer = 10;
+                    lastTimerUpdate = now;
+                    
+                } else {
+                    // Only broadcast if clients are connected
+                    if (gameState.clients.size > 0) {
+                        broadcast({ 
+                            type: 'multiplier', 
+                            multiplier: gameState.multiplier,
+                            roundNumber: gameState.roundNumber
+                        });
+                    }
+                }
+                break;
+        }
+    } catch (err) {
+        console.error('❌ Game loop error:', err.message);
+    }
+    
+    setTimeout(gameLoop, 50);
+}
+
+// =========================================
+// WEBSOCKET CONNECTION HANDLER
+// =========================================
+wss.on('connection', (ws, req) => {
+    const clientIp = req.socket.remoteAddress;
+    const clientPort = req.socket.remotePort;
+    const forwardedFor = req.headers['x-forwarded-for'];
+    const userAgent = req.headers['user-agent'];
+    const clientId = Date.now() + Math.random().toString(36).substr(2, 6);
+    
+    console.log('🟢 NEW CLIENT CONNECTED!');
+    console.log('   Client ID:', clientId);
+    console.log('   IP:', clientIp);
+    console.log('   Port:', clientPort);
+    console.log('   Forwarded For:', forwardedFor);
+    console.log('   User Agent:', userAgent);
+    console.log('   Total Clients:', gameState.clients.size + 1);
+    
+    gameState.clients.set(clientId, ws);
+    
+    // Send initial game state
+    try {
+        ws.send(JSON.stringify({
+            type: 'state',
+            state: {
+                status: gameState.status,
+                multiplier: gameState.multiplier,
+                timer: gameState.roundTimer,
+                roundNumber: gameState.roundNumber
+            }
+        }));
+        console.log(`📨 Sent initial state to ${clientId}`);
+    } catch (err) {
+        console.log(`❌ Failed to send initial state:`, err.message);
+    }
+    
+    // Send recent history
+    if (dbAvailable) {
+        (async () => {
+            try {
+                const [rows] = await pool.query(
+                    'SELECT crash_point FROM round_history ORDER BY id DESC LIMIT 5'
+                );
+                ws.send(JSON.stringify({
+                    type: 'history',
+                    history: rows
+                }));
+            } catch (err) {
+                console.log('❌ Failed to fetch history:', err.message);
+            }
+        })();
+    }
+    
+    // Handle messages
+    ws.on('message', (message) => {
+        try {
+            const data = JSON.parse(message);
+            console.log(`📩 Message from ${clientId}:`, data.type || 'unknown');
+            
+            switch(data.type) {
+                case 'ping':
+                    ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
+                    break;
+                    
+                case 'place_bet':
+                    const { userId, amount, autoCashout } = data;
+                    
+                    if (gameState.status === 'waiting' || 
+                        (gameState.status === 'flying' && gameState.multiplier < 1.3)) {
+                        
+                        if (amount >= 10 && amount <= 10000) {
+                            gameState.bets.set(clientId, {
+                                userId: userId || clientId,
+                                amount: amount,
+                                autoCashout: autoCashout,
+                                placedAt: gameState.multiplier,
+                                roundNumber: gameState.roundNumber,
+                                cashedOut: false
+                            });
+                            
+                            console.log(`💰 Bet: ${clientId} - KES ${amount}`);
+                            
+                            ws.send(JSON.stringify({
+                                type: 'bet_confirmed',
+                                amount: amount,
+                                multiplier: gameState.multiplier,
+                                roundNumber: gameState.roundNumber
+                            }));
+                        }
+                    }
+                    break;
+                    
+                case 'cashout':
+                    const bet = gameState.bets.get(clientId);
+                    if (bet && !bet.cashedOut && gameState.status === 'flying') {
+                        bet.cashedOut = true;
+                        const winAmount = bet.amount * gameState.multiplier;
+                        
+                        console.log(`💰 Cashout: ${clientId} - KES ${winAmount.toFixed(2)} at ${gameState.multiplier}x`);
+                        
+                        ws.send(JSON.stringify({
+                            type: 'cashout_success',
+                            winAmount: winAmount,
+                            multiplier: gameState.multiplier,
+                            roundNumber: gameState.roundNumber
+                        }));
+                        
+                        gameState.bets.delete(clientId);
+                    }
+                    break;
+            }
+        } catch (err) {
+            console.log(`❌ Message error from ${clientId}:`, err.message);
+        }
+    });
+    
+    ws.on('close', (code, reason) => {
+        console.log(`🔴 Client ${clientId} disconnected. Code: ${code}, Reason: ${reason}`);
+        gameState.clients.delete(clientId);
+        gameState.bets.delete(clientId);
+        console.log(`   Remaining Clients: ${gameState.clients.size}`);
+    });
+    
+    ws.on('error', (err) => {
+        console.log(`❌ WebSocket error for ${clientId}:`, err.message);
+    });
+    
+    // Send ping to keep connection alive
+    const pingInterval = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'ping' }));
+        } else {
+            clearInterval(pingInterval);
+        }
+    }, 30000);
+});
+
+// Handle server errors
+server.on('error', (err) => {
+    console.error('❌ Server error:', err.message);
+});
+
+// =========================================
+// START SERVER
+// =========================================
+async function startServer() {
+    console.log('=================================');
+    console.log('   MulaCrash WebSocket Server');
+    console.log('=================================');
+    console.log(`📡 Port: ${PORT}`);
+    console.log(`🌐 Server IPs: ${getServerIPs().join(', ')}`);
+    console.log(`💾 Connecting to HostPinnacle DB: ${DB_CONFIG.host}`);
+    console.log('=================================');
+    
+    // Connect to database
+    await connectToHostPinnacleDB();
+    
+    // Start server - bind to all interfaces
+    server.listen(PORT, '0.0.0.0', () => {
+        console.log(`🌐 Server listening on port ${PORT}`);
+        console.log(`📊 Health check: http://localhost:${PORT}/health`);
+        console.log(`🔌 WebSocket URL: ws://51.75.118.5:${PORT}`);
+        console.log('=================================');
+        
+        // Start game loop
+        console.log('🎮 Starting game loop...');
+        setTimeout(gameLoop, 1000);
+    });
+}
+
+// Error handling
+process.on('uncaughtException', (err) => {
+    console.error('❌ Uncaught exception:', err.message);
+});
+
+process.on('unhandledRejection', (err) => {
+    console.error('❌ Unhandled rejection:', err.message);
+});
+
+// Graceful shutdown
+process.on('SIGINT', async () => {
+    console.log('\n🛑 Shutting down gracefully...');
+    
+    // Notify clients
+    broadcast({ type: 'shutdown', message: 'Server is shutting down' });
+    
+    // Close all connections
+    wss.clients.forEach(client => {
+        client.close();
+    });
+    
+    // Close server
+    server.close(() => {
+        console.log('✅ Server closed');
+        if (pool) {
+            pool.end().then(() => {
+                console.log('✅ Database connections closed');
+                process.exit(0);
+            });
+        } else {
+            process.exit(0);
+        }
+    });
+});
+
+process.on('SIGTERM', () => {
+    process.emit('SIGINT');
+});
+
+// Start the server
+startServer();
